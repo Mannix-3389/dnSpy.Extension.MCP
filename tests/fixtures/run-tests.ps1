@@ -72,7 +72,31 @@ if (-not $resolved) {
     throw "dnSpy.exe not found at $DnSpyExe. Build the Release/$Tfm distribution first: $hint"
 }
 $dnSpyExeFull = $resolved.Path
-$extDeployDir = Join-Path (Split-Path $dnSpyExeFull -Parent) 'bin\Extensions\dnSpy.Extension.MCP'
+
+# Discover dnSpy's ACTUAL extension directory instead of hard-coding it. dnSpy loads *.x.dll from
+# its BinDirectory (where dnSpy.dll lives) and from <BinDirectory>\Extensions\<name>\. Depending on
+# how the app was built (plain layout vs build.ps1's rearranged bin\ subfolder) BinDirectory is
+# either the exe's own folder or a bin\ subfolder — a hard-coded 'bin\Extensions' silently breaks
+# when the layout changes (issue: the extension deploys to a folder dnSpy never scans, so it's
+# never loaded, the server never starts, and — because Release builds don't write the disk log —
+# there's no trace; the only symptom is "server never came up"). Anchor on where dnSpy's OWN
+# extensions (e.g. dnSpy.Analyzer.x.dll) actually sit.
+function Resolve-DnSpyBinDirectory([string]$exePath)
+{
+    $exeDir = Split-Path $exePath -Parent
+    # BinDirectory is the directory that contains dnSpy.dll next to the marker extension.
+    foreach ($candidate in @($exeDir, (Join-Path $exeDir 'bin'))) {
+        if ((Test-Path (Join-Path $candidate 'dnSpy.dll')) -and
+            (Test-Path (Join-Path $candidate 'dnSpy.Analyzer.x.dll'))) {
+            return $candidate
+        }
+    }
+    throw "Could not locate dnSpy's BinDirectory (dnSpy.dll + dnSpy.Analyzer.x.dll) under $exeDir. Is this a complete dnSpy build?"
+}
+$dnSpyBinDir = Resolve-DnSpyBinDirectory $dnSpyExeFull
+$extDeployDir = Join-Path $dnSpyBinDir 'Extensions\dnSpy.Extension.MCP'
+Write-Host "  dnSpy BinDirectory: $dnSpyBinDir"
+Write-Host "  Extension deploy dir: $extDeployDir"
 
 $pass = 0; $fail = 0
 function Assert($condition, [string]$label, [string]$detail = '')
@@ -153,7 +177,28 @@ while ((Get-Date) -lt $deadline -and -not $found)
     }
     if (-not $found) { Start-Sleep -Milliseconds 500 }
 }
-if (-not $found) { throw "MCP server never came up on ports $Port..$($Port+19)" }
+if (-not $found)
+{
+    # Don't just say "never came up" — that's ambiguous (wrong deploy dir vs load fault vs port
+    # conflict vs crash). Dump enough to tell them apart, since Release builds leave no disk log.
+    Write-Host "" ; Write-Host "===== DIAGNOSTIC: MCP server never came up =====" -ForegroundColor Yellow
+    Write-Host "  dnSpy exe:          $dnSpyExeFull"
+    Write-Host "  dnSpy BinDirectory: $dnSpyBinDir"
+    Write-Host "  Deployed extension: $extDeployDir\$(Split-Path $extDllSrc -Leaf)  (exists=$(Test-Path (Join-Path $extDeployDir (Split-Path $extDllSrc -Leaf))))"
+    $ownExt = @(Get-ChildItem $dnSpyBinDir -Filter '*.x.dll' -EA SilentlyContinue).Count
+    Write-Host "  dnSpy's own *.x.dll in BinDirectory: $ownExt  (if 0, BinDirectory is wrong)"
+    Write-Host "  dnSpy process alive: $(if ($dnSpyProc -and -not $dnSpyProc.HasExited) {'yes'} else {'NO — it crashed/exited on launch'})"
+    $logPath = 'D:\dnspy-mcp.log'
+    if (Test-Path $logPath) {
+        Write-Host "  --- $logPath (tail) ---"
+        Get-Content $logPath -Tail 15 | ForEach-Object { Write-Host "    $_" }
+    } else {
+        Write-Host "  ${logPath}: absent. NOTE: Release builds do NOT write this log (#if DEBUG only), so"
+        Write-Host "  its absence proves nothing. Deploy a Debug build to get startup telemetry."
+    }
+    Write-Host "================================================" -ForegroundColor Yellow
+    throw "MCP server never came up on ports $Port..$($Port+19) — see DIAGNOSTIC above"
+}
 Write-Host "  MCP server is up on port $script:Port"
 
 # Wait for TestIL to actually appear in the tree. dnSpy loads CLI-provided files
